@@ -372,3 +372,240 @@ REPORT Duration: 15279.37 ms Billed Duration: 15280 ms Memory Size: 256 MB Max M
 | **Total** | **< $0.01** |
 
 ---
+---
+
+---
+
+## Overview
+
+Phase 4 implements the detection layer on top of the CloudTrail ingestion pipeline built in Phase 3. Three custom detection rules were written in Elastic Security's rule engine, each targeting a specific cloud attack technique mapped to the MITRE ATT&CK framework. Each rule was deliberately triggered to validate end-to-end detection: from AWS API call → CloudTrail log → S3 → SQS → Lambda → Elastic → Alert.
+
+---
+
+## Detection Rules
+
+### Rule 1: S3 GetObject from External IP
+
+| Property | Value |
+| --- | --- |
+| **Rule Name** | S3 GetObject from External IP |
+| **Rule ID** | Custom query rule |
+| **Severity** | Medium |
+| **Schedule** | Every 5 minutes |
+| **Data Source** | `cloudtrail-logs` index |
+| **MITRE ATT&CK** | T1530 - Data from Cloud Storage |
+| **Tactic** | Exfiltration |
+
+**KQL Query:**
+
+```
+event.action : "GetObject" AND event.provider : "s3.amazonaws.com"
+```
+
+**What It Detects:**
+Detects `s3:GetObject` API calls via CloudTrail data events. Any entity accessing objects in the monitored S3 bucket generates this alert. In production, a filter would exclude trusted IP ranges (corporate VPN, office egress, CI/CD runners). For this project, the rule fires on all `GetObject` calls to validate the pipeline.
+
+**Trigger Method:**
+
+```bash
+curl <https://target-data-leak-2026.s3.amazonaws.com/test-file.txt>
+```
+
+Access was performed from an IP outside the AWS Console's standard range, generating the alert.
+
+**Alert Count:** 15
+
+**False Positive Analysis:**
+
+- Legitimate third-party SaaS integrations that read from S3
+- Internal applications and microservices accessing shared storage
+- CI/CD pipeline artifact retrieval
+- AWS service accounts performing automated tasks
+- Security scanning tools
+
+**Production Hardening:**
+
+- Add an exclusion list of trusted IP ranges
+- Correlate with known user agents (AWS SDK, Console)
+- Suppress alerts during maintenance windows
+- Generate higher severity if combined with unusual data volume
+
+---
+
+### Rule 2: AdministratorAccess Policy Attached to IAM User
+
+| Property | Value |
+| --- | --- |
+| **Rule Name** | AdministratorAccess Policy Attached to IAM User |
+| **Rule ID** | Custom query rule |
+| **Severity** | High |
+| **Schedule** | Every 5 minutes |
+| **Data Source** | `cloudtrail-logs` index |
+| **MITRE ATT&CK** | T1098 - Account Manipulation |
+| **Tactic** | Persistence, Privilege Escalation |
+
+**KQL Query:**
+
+```
+event.action : "AttachUserPolicy" AND event.provider : "iam.amazonaws.com" AND aws.cloudtrail.flattened.requestParameters.policyArn : "arn:aws:iam::aws:policy/AdministratorAccess"
+```
+
+**What It Detects:**
+Detects when the AWS-managed `AdministratorAccess` policy is attached to any IAM user. This policy grants unrestricted access to all AWS resources. Unauthorized attachment is a critical privilege escalation indicator. Attackers who compromise credentials often attach this policy to maintain persistence.
+
+**Trigger Method:**
+
+1. Navigate to IAM → Users → `project-admin`
+2. Add Permissions → Attach policies directly
+3. Search `AdministratorAccess`, check, and attach
+
+**Alert Count:** 1
+
+**False Positive Analysis:**
+
+- Legitimate administrator onboarding during business hours
+- Automated IAM provisioning scripts (CI/CD admin account creation)
+- Emergency access procedures by authorized security personnel
+- Break-glass account provisioning
+
+**Production Hardening:**
+
+- Correlate with change management tickets
+- Exclude known admin provisioning roles/user ARNs
+- Suppress during approved change windows
+- Escalate to Critical if performed outside business hours with no corresponding ticket
+
+---
+
+### Rule 3: STS AssumeRole from Suspicious User Agent
+
+| Property | Value |
+| --- | --- |
+| **Rule Name** | STS AssumeRole from Suspicious User Agent |
+| **Rule ID** | Custom query rule |
+| **Severity** | Medium |
+| **Schedule** | Every 5 minutes |
+| **Data Source** | `cloudtrail-logs` index |
+| **MITRE ATT&CK** | T1078.001 - Valid Accounts: Default Accounts |
+| **Tactic** | Credential Access, Defense Evasion |
+
+**KQL Query:**
+
+```
+event.action : "AssumeRole" AND event.provider : "sts.amazonaws.com" AND NOT user_agent.original : *aws-cli* AND NOT user_agent.original : *boto3* AND NOT user_agent.original : *console.amazonaws.com* AND NOT user_agent.original : *signin.amazonaws.com* AND NOT user_agent.original : *aws-sdk* AND NOT user_agent.original : *Lambda* AND NOT user_agent.original : *CloudFormation*
+```
+
+**What It Detects:**
+Detects `sts:AssumeRole` API calls where the user agent string does not match any known legitimate AWS tooling (CLI, SDK, Console, CloudFormation, Lambda). Custom scripts, malware implants, and attacker tooling often use non-standard or completely absent user agent strings.
+
+**Trigger Method:**
+
+```bash
+python3 -c "import boto3; from botocore.config import Config; config = Config(user_agent='CustomMalware/1.0'); client = boto3.client('sts', config=config); print(client.get_caller_identity())"
+```
+
+This invokes `sts:GetCallerIdentity` (which internally calls AssumeRole-like mechanics) with a user agent string `CustomMalware/1.0`, which is not in the exclusion list.
+
+**Alert Count:** 2
+
+**False Positive Analysis:**
+
+- Internal security testing tools (e.g., ScoutSuite, Prowler, Pacu)
+- Custom monitoring scripts with hardcoded user agents
+- Third-party security products integrating with AWS APIs
+- Developers using non-standard SDK wrappers
+- Incident response tooling
+
+**Production Hardening:**
+
+- Maintain an allowlist of known internal tool user agent substrings
+- Correlate with the role ARN — high-value roles (Admin, OrgManagement) should generate Critical severity
+- Check if the source IP is within corporate range before suppressing
+- Investigate any user agent containing "custom", "malware", "hack", or similar indicators
+
+---
+
+## Alert Summary
+
+| Rule | Severity | Alert Count | MITRE ATT&CK |
+| --- | --- | --- | --- |
+| S3 GetObject from External IP | Medium | 15 | T1530 |
+| AdministratorAccess Policy Attached to IAM User | High | 1 | T1098 |
+| STS AssumeRole from Suspicious User Agent | Medium | 2 | T1078.001 |
+| **Total** |  | **18** |  |
+
+---
+
+## Validation Methodology
+
+Each rule was validated using the following process:
+
+1. **Enable Rule** in Elastic Security.
+2. **Perform Malicious Action** in AWS (CLI, Console, or SDK).
+3. **Wait 5-10 minutes** for CloudTrail delivery → S3 notification → SQS → Lambda → Elastic.
+4. **Verify Alert** in Elastic Security → Alerts.
+5. **Capture Screenshot** of alert with rule name, severity, timestamp, and count.
+6. **Document** the trigger method, KQL query, and false positive analysis.
+
+---
+
+## Architecture (End-to-End)
+
+```
+AWS API Call (malicious action)
+        │
+        ▼
+AWS CloudTrail (data & management events)
+        │
+        ▼
+S3 Bucket: walentino-cloudtrail-logs-2026
+        │
+        ▼ (S3 Event Notification)
+SQS Queue: elastic-cloudtrail-queue
+        │
+        ▼ (Lambda Event Source Mapping)
+AWS Lambda: esf-cloudtrail-forwarder
+        │
+        ▼ (Elasticsearch API)
+Elastic Security Serverless
+        │
+        ▼
+Index: cloudtrail-logs
+        │
+        ▼
+Elastic Security Rules (KQL queries)
+        │
+        ▼
+Alerts Dashboard
+```
+
+---
+
+## Skills Demonstrated
+
+- **Detection Engineering:** Writing KQL-based detection rules targeting cloud attack techniques
+- **MITRE ATT&CK Mapping:** Aligning detection logic with industry-standard framework
+- **False Positive Analysis:** Anticipating legitimate scenarios and proposing exclusion strategies
+- **Alert Validation:** Triggering real AWS API calls to generate and verify alerts
+- **SIEM Operations:** Managing rules, schedules, and alert triage in a production SIEM
+- **Documentation:** Comprehensive rule documentation suitable for a SOC runbook
+
+---
+
+## Next Phase
+
+**Project 2: The Automated Responder** — Enable Amazon GuardDuty, trigger a real threat finding, and build a Lambda function that automatically contains compromised IAM credentials via quarantine policy attachment, console session revocation, and SNS notification.
+
+---
+
+## Cost Summary
+
+| Resource | Cost |
+| --- | --- |
+| CloudTrail data events (test accesses) | < $0.01 |
+| All other resources (Free Tier) | $0.00 |
+| Elastic Cloud (14-day trial) | $0.00 |
+| **Total** | **< $0.01** |
+
+---
+
